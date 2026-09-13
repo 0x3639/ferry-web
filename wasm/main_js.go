@@ -257,11 +257,16 @@ func underStoreLock(fn func() []byte) []byte {
 		return nil
 	})
 	// A manager that throws instead of returning a promise is answered the
-	// same way, and the callbacks it never took are let go.
+	// same way, and the callbacks it never took are let go. One that grants
+	// and then throws is a late rejection by another route, and gets the
+	// same answer: none, because the work's is on its way.
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				releaseHandlers()
+				if granted.Load() {
+					return
+				}
 				releaseHolder()
 				settle(errorJSON(panicErr(r)))
 			}

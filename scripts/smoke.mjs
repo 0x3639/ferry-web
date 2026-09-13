@@ -973,13 +973,15 @@ ok(
 const missing = await call('get', {id: 'deadbeefdeadbeef'})
 ok('a missing swap answers with an error', /no swap with id/.test(missing.error ?? ''), missing.error)
 
-section('every call is made under the cross-tab lock, and the lock cannot wedge a call')
+section('every call is made under the cross-tab lock, and however the lock answers, the call answers')
 
 // Node has no Web Locks API, so above this point every call ran unlocked, as
 // the module allows where there is no document. What follows stands in a lock
-// manager for the browser's and checks the bridge around it: a call must
-// answer whatever the manager does, because a call that never settles leaves
-// the page with a spinner and the user with no way to reach their swap.
+// manager for the browser's and checks the bridge around it: whatever the
+// manager answers, the call must answer too, because a call that never
+// settles leaves the page with a spinner and the user with no way to reach
+// their swap. A manager that never answers at all is the one shape nothing
+// here can rescue, and none of these stands in for it.
 //
 // The manager is replaced per scenario rather than mocked once: what the
 // scenarios differ in is exactly the manager's behaviour.
@@ -1089,6 +1091,24 @@ installLocks({
 const threwSync = await settles(call('get', {id}))
 ok('a manager that throws answers the call with the error', /request is not a function today/.test(threwSync.error ?? ''), JSON.stringify(threwSync))
 
+// 4b. The request grants and then throws. The work is already under way,
+//     so, as with a rejection after grant, the work's answer is the call's.
+//     The call reaches for a node for the same reason as in 3b.
+installLocks({
+  request: (name, holder) => {
+    void holder({name, mode: 'exclusive'})
+    throw new TypeError('boom after grant')
+  },
+})
+const threwAfterGrant = await settles(
+  call('estimate', {id, settings: {...SETTINGS, btcEsplora: 'http://127.0.0.1:1'}}),
+)
+ok(
+  'a manager that grants and then throws still answers with the work',
+  threwAfterGrant.feeRateFrom === 'fallback' && !threwAfterGrant.error,
+  JSON.stringify(threwAfterGrant),
+)
+
 // 5. The request settles normally, and the callbacks the bridge handed to it
 //    are let go afterwards. Go keeps a callback registered until it is
 //    released, so one left behind per call is memory the tab never gets
@@ -1121,6 +1141,33 @@ ok(
     typeof attached?.onRejected === 'function' &&
     released.filter((line) => /call to released function/.test(line)).length === 2,
   `attached ${JSON.stringify(Object.keys(attached ?? {}))}, logged ${JSON.stringify(released)}`,
+)
+
+// 5b. The same, when the request is refused: the refusal answers the call,
+//     and both handlers are let go all the same.
+let attachedRefused
+installLocks({
+  request: () => ({
+    then(onFulfilled, onRejected) {
+      attachedRefused = {onFulfilled, onRejected}
+      onRejected(new DOMException('locks are unavailable to this origin', 'SecurityError'))
+    },
+  }),
+})
+const refusedThenable = await settles(call('get', {id}))
+ok('a refusal through a thenable answers the call with the refusal', /SecurityError/.test(refusedThenable.error ?? ''), JSON.stringify(refusedThenable))
+const releasedAfterRefusal = []
+console.error = (...parts) => releasedAfterRefusal.push(parts.join(' '))
+try {
+  attachedRefused?.onFulfilled?.()
+  attachedRefused?.onRejected?.(new Error('late'))
+} finally {
+  console.error = consoleError
+}
+ok(
+  'both handlers are released after a refusal too',
+  releasedAfterRefusal.filter((line) => /call to released function/.test(line)).length === 2,
+  JSON.stringify(releasedAfterRefusal),
 )
 
 restoreNavigator()
