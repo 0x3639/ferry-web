@@ -1112,62 +1112,57 @@ ok(
 // 5. The request settles normally, and the callbacks the bridge handed to it
 //    are let go afterwards. Go keeps a callback registered until it is
 //    released, so one left behind per call is memory the tab never gets
-//    back. A thenable manager keeps hold of the handlers the bridge attaches;
-//    invoking a released one makes Go log "call to released function" rather
-//    than run anything, which is the observable this checks.
+//    back. A thenable manager keeps hold of the holder and of the handlers
+//    the bridge attaches; invoking a released one makes Go log "call to
+//    released function" rather than run anything, which is the observable
+//    this checks.
+const consoleError = console.error
+const releasedOf = (callbacks) => {
+  const logged = []
+  console.error = (...parts) => logged.push(parts.join(' '))
+  try {
+    for (const cb of callbacks) cb?.(new Error('late'))
+  } finally {
+    console.error = consoleError
+  }
+  return logged.filter((line) => /call to released function/.test(line)).length
+}
 let attached
 installLocks({
   request: (name, holder) => ({
     then(onFulfilled, onRejected) {
-      attached = {onFulfilled, onRejected}
+      attached = {holder, onFulfilled, onRejected}
       holder({name, mode: 'exclusive'}).then(onFulfilled, onRejected)
     },
   }),
 })
 const fulfilledLock = await settles(call('get', {id}))
 ok('a call whose request is a thenable answers', fulfilledLock.id === id, JSON.stringify(fulfilledLock))
-const released = []
-const consoleError = console.error
-console.error = (...parts) => released.push(parts.join(' '))
-try {
-  attached?.onFulfilled?.()
-  attached?.onRejected?.(new Error('late'))
-} finally {
-  console.error = consoleError
-}
 ok(
-  'both handlers the request took are released once it settles',
-  typeof attached?.onFulfilled === 'function' &&
-    typeof attached?.onRejected === 'function' &&
-    released.filter((line) => /call to released function/.test(line)).length === 2,
-  `attached ${JSON.stringify(Object.keys(attached ?? {}))}, logged ${JSON.stringify(released)}`,
+  'the holder and both handlers the request took are released once it settles',
+  [attached?.holder, attached?.onFulfilled, attached?.onRejected].every((cb) => typeof cb === 'function') &&
+    releasedOf([attached.holder, attached.onFulfilled, attached.onRejected]) === 3,
+  `attached ${JSON.stringify(Object.keys(attached ?? {}))}`,
 )
 
 // 5b. The same, when the request is refused: the refusal answers the call,
 //     and both handlers are let go all the same.
 let attachedRefused
 installLocks({
-  request: () => ({
+  request: (_name, holder) => ({
     then(onFulfilled, onRejected) {
-      attachedRefused = {onFulfilled, onRejected}
+      attachedRefused = {holder, onFulfilled, onRejected}
       onRejected(new DOMException('locks are unavailable to this origin', 'SecurityError'))
     },
   }),
 })
 const refusedThenable = await settles(call('get', {id}))
 ok('a refusal through a thenable answers the call with the refusal', /SecurityError/.test(refusedThenable.error ?? ''), JSON.stringify(refusedThenable))
-const releasedAfterRefusal = []
-console.error = (...parts) => releasedAfterRefusal.push(parts.join(' '))
-try {
-  attachedRefused?.onFulfilled?.()
-  attachedRefused?.onRejected?.(new Error('late'))
-} finally {
-  console.error = consoleError
-}
 ok(
-  'both handlers are released after a refusal too',
-  releasedAfterRefusal.filter((line) => /call to released function/.test(line)).length === 2,
-  JSON.stringify(releasedAfterRefusal),
+  'the holder it never invoked and both handlers are released after a refusal too',
+  [attachedRefused?.holder, attachedRefused?.onFulfilled, attachedRefused?.onRejected].every((cb) => typeof cb === 'function') &&
+    releasedOf([attachedRefused.holder, attachedRefused.onFulfilled, attachedRefused.onRejected]) === 3,
+  `attached ${JSON.stringify(Object.keys(attachedRefused ?? {}))}`,
 )
 
 restoreNavigator()
