@@ -225,9 +225,25 @@ func underStoreLock(fn func() []byte) []byte {
 	// work is under way or done, its save may already have landed, and the
 	// only true answer is the work's own. Either way the rejection is handled
 	// here rather than left for the page to report as unhandled.
-	var refused js.Func
+	//
+	// Go keeps a callback registered until it is released, so the request is
+	// given a handler for each outcome and whichever fires lets both go; a
+	// handler left behind on every successful call would be memory the tab
+	// never got back.
+	var fulfilled, refused js.Func
+	var handlersDone sync.Once
+	releaseHandlers := func() {
+		handlersDone.Do(func() {
+			fulfilled.Release()
+			refused.Release()
+		})
+	}
+	fulfilled = js.FuncOf(func(js.Value, []js.Value) any {
+		releaseHandlers()
+		return nil
+	})
 	refused = js.FuncOf(func(_ js.Value, args []js.Value) any {
-		defer refused.Release()
+		defer releaseHandlers()
 		if granted.Load() {
 			return nil
 		}
@@ -241,16 +257,16 @@ func underStoreLock(fn func() []byte) []byte {
 		return nil
 	})
 	// A manager that throws instead of returning a promise is answered the
-	// same way, and the two callbacks it never took are let go.
+	// same way, and the callbacks it never took are let go.
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				refused.Release()
+				releaseHandlers()
 				releaseHolder()
 				settle(errorJSON(panicErr(r)))
 			}
 		}()
-		locks.Call("request", "ferry:"+StorageKeyPrefix(), holder).Call("then", js.Null(), refused)
+		locks.Call("request", "ferry:"+StorageKeyPrefix(), holder).Call("then", fulfilled, refused)
 	}()
 	return <-out
 }

@@ -1043,10 +1043,11 @@ ok(
   trace.join(', '),
 )
 
-// 3. The request rejects after the holder has run and released: this is what a
-//    manager does when another context takes the same lock with "steal". The
-//    call already has its answer, and the late rejection must neither replace
-//    it nor block the bridge for the call after it.
+// 3. The request rejects after the holder has run and released. A conforming
+//    manager settles the request with the holder's own outcome, so this shape
+//    does not arise from one; it is kept because the call already has its
+//    answer, and a bridge that tolerated a second answer only by luck would
+//    send twice on a full channel and block the event loop.
 installLocks({
   request: async (name, holder) => {
     await holder({name, mode: 'exclusive'})
@@ -1087,6 +1088,40 @@ installLocks({
 })
 const threwSync = await settles(call('get', {id}))
 ok('a manager that throws answers the call with the error', /request is not a function today/.test(threwSync.error ?? ''), JSON.stringify(threwSync))
+
+// 5. The request settles normally, and the callbacks the bridge handed to it
+//    are let go afterwards. Go keeps a callback registered until it is
+//    released, so one left behind per call is memory the tab never gets
+//    back. A thenable manager keeps hold of the handlers the bridge attaches;
+//    invoking a released one makes Go log "call to released function" rather
+//    than run anything, which is the observable this checks.
+let attached
+installLocks({
+  request: (name, holder) => ({
+    then(onFulfilled, onRejected) {
+      attached = {onFulfilled, onRejected}
+      holder({name, mode: 'exclusive'}).then(onFulfilled, onRejected)
+    },
+  }),
+})
+const fulfilledLock = await settles(call('get', {id}))
+ok('a call whose request is a thenable answers', fulfilledLock.id === id, JSON.stringify(fulfilledLock))
+const released = []
+const consoleError = console.error
+console.error = (...parts) => released.push(parts.join(' '))
+try {
+  attached?.onFulfilled?.()
+  attached?.onRejected?.(new Error('late'))
+} finally {
+  console.error = consoleError
+}
+ok(
+  'both handlers the request took are released once it settles',
+  typeof attached?.onFulfilled === 'function' &&
+    typeof attached?.onRejected === 'function' &&
+    released.filter((line) => /call to released function/.test(line)).length === 2,
+  `attached ${JSON.stringify(Object.keys(attached ?? {}))}, logged ${JSON.stringify(released)}`,
+)
 
 restoreNavigator()
 // Let any rejection the scenarios left behind surface before it is counted.
