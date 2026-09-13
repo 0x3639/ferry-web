@@ -24,6 +24,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"syscall/js"
 )
 
@@ -178,31 +180,77 @@ func underStoreLock(fn func() []byte) []byte {
 		}
 		return fn()
 	}
+	// The answer travels through settle, which takes the first answer and
+	// drops any other. Three paths below can answer -- the work, a panic in
+	// it, and the request's rejection handler -- and a second send on a full
+	// channel from a browser callback would block the event loop for good.
 	out := make(chan []byte, 1)
+	var settled sync.Once
+	settle := func(answer []byte) { settled.Do(func() { out <- answer }) }
 	// The callback must return a promise and not block: it is invoked from the
 	// browser's event loop, and Go code that blocks there deadlocks the module.
 	// The work runs on a goroutine; the promise it resolves is what the browser
 	// holds the lock open for.
 	var holder js.Func
+	var holderDone sync.Once
+	releaseHolder := func() { holderDone.Do(holder.Release) }
+	// Set once the lock has been granted and the work is under way, at which
+	// point the request's outcome no longer decides the call's answer.
+	var granted atomic.Bool
 	holder = js.FuncOf(func(js.Value, []js.Value) any {
+		granted.Store(true)
 		var exec js.Func
 		exec = js.FuncOf(func(_ js.Value, args []js.Value) any {
 			release := args[0]
 			go func() {
 				defer exec.Release()
-				defer holder.Release()
+				defer releaseHolder()
 				defer func() {
 					if r := recover(); r != nil {
-						out <- errorJSON(panicErr(r))
+						settle(errorJSON(panicErr(r)))
 					}
 					release.Invoke()
 				}()
-				out <- fn()
+				settle(fn())
 			}()
 			return nil
 		})
 		return js.Global().Get("Promise").New(exec)
 	})
-	locks.Call("request", "ferry:"+StorageKeyPrefix(), holder)
+	// The request itself can fail, and then the holder is never invoked and
+	// nothing above would ever answer. A manager may refuse outright -- the
+	// specification allows a SecurityError -- or reject the request later,
+	// once the holder is running, when another context takes the lock with
+	// "steal". The first is answered as a refusal. The second is not: the
+	// work is under way or done, its save may already have landed, and the
+	// only true answer is the work's own. Either way the rejection is handled
+	// here rather than left for the page to report as unhandled.
+	var refused js.Func
+	refused = js.FuncOf(func(_ js.Value, args []js.Value) any {
+		defer refused.Release()
+		if granted.Load() {
+			return nil
+		}
+		defer releaseHolder()
+		reason := "no reason given"
+		if len(args) > 0 && args[0].Type() != js.TypeUndefined && args[0].Type() != js.TypeNull {
+			reason = js.Global().Get("String").Invoke(args[0]).String()
+		}
+		settle(errorJSON(fmt.Errorf("the browser refused the lock Ferry takes on its swaps (%s). "+
+			"Nothing was changed; reload the page and try again", reason)))
+		return nil
+	})
+	// A manager that throws instead of returning a promise is answered the
+	// same way, and the two callbacks it never took are let go.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				refused.Release()
+				releaseHolder()
+				settle(errorJSON(panicErr(r)))
+			}
+		}()
+		locks.Call("request", "ferry:"+StorageKeyPrefix(), holder).Call("then", js.Null(), refused)
+	}()
 	return <-out
 }

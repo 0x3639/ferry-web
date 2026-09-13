@@ -973,6 +973,127 @@ ok(
 const missing = await call('get', {id: 'deadbeefdeadbeef'})
 ok('a missing swap answers with an error', /no swap with id/.test(missing.error ?? ''), missing.error)
 
+section('every call is made under the cross-tab lock, and the lock cannot wedge a call')
+
+// Node has no Web Locks API, so above this point every call ran unlocked, as
+// the module allows where there is no document. What follows stands in a lock
+// manager for the browser's and checks the bridge around it: a call must
+// answer whatever the manager does, because a call that never settles leaves
+// the page with a spinner and the user with no way to reach their swap.
+//
+// The manager is replaced per scenario rather than mocked once: what the
+// scenarios differ in is exactly the manager's behaviour.
+const savedNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+const installLocks = (locks) =>
+  Object.defineProperty(globalThis, 'navigator', {value: {locks}, configurable: true})
+const restoreNavigator = () => Object.defineProperty(globalThis, 'navigator', savedNavigator)
+
+// A rejection nobody handles is a bug in the bridge whichever way the call
+// went; Node would otherwise turn it into a crash with no assertion attached.
+const unhandled = []
+const noteUnhandled = (reason) => unhandled.push(String(reason))
+process.on('unhandledRejection', noteUnhandled)
+
+const HANG_MS = 2000
+const settles = (promise) =>
+  Promise.race([
+    promise,
+    new Promise((r) => setTimeout(() => r({error: `(no answer within ${HANG_MS} ms)`}), HANG_MS)),
+  ])
+const lockName = `ferry:${swapPrefix}`
+
+// 1. The request is refused before the lock is ever granted. The spec lets a
+//    manager reject with a SecurityError, and a rejected request never invokes
+//    the holder, so nothing inside the holder can answer the call.
+installLocks({
+  request: () => Promise.reject(new DOMException('locks are unavailable to this origin', 'SecurityError')),
+})
+const lockRefused = await settles(call('get', {id}))
+ok(
+  'a lock refused before it is granted answers the call with the refusal',
+  /lock/i.test(lockRefused.error ?? '') && /SecurityError/.test(lockRefused.error ?? ''),
+  JSON.stringify(lockRefused),
+)
+
+// 2. A manager that grants in order and holds each lock until the holder's
+//    promise settles, which is what the browser's does. Two calls issued at
+//    once must run one after the other under the instance's lock name.
+const trace = []
+const queues = new Map()
+installLocks({
+  request(name, holder) {
+    const prev = queues.get(name) ?? Promise.resolve()
+    const run = prev.then(async () => {
+      trace.push(`grant ${name}`)
+      await holder({name, mode: 'exclusive'})
+      trace.push(`release ${name}`)
+    })
+    queues.set(name, run.catch(() => {}))
+    return run
+  },
+})
+const [firstUnderLock, secondUnderLock] = await settles(
+  Promise.all([call('get', {id}), call('get', {id: 'deadbeefdeadbeef'})]),
+).then((r) => (Array.isArray(r) ? r : [r, r]))
+ok('a call under the lock answers as it does without one', firstUnderLock.id === id, JSON.stringify(firstUnderLock))
+ok('a second call under the lock answers too', /no swap with id/.test(secondUnderLock.error ?? ''), JSON.stringify(secondUnderLock))
+ok(
+  'two calls issued at once run one after the other, under the instance lock name',
+  trace.join(', ') === [`grant ${lockName}`, `release ${lockName}`, `grant ${lockName}`, `release ${lockName}`].join(', '),
+  trace.join(', '),
+)
+
+// 3. The request rejects after the holder has run and released: this is what a
+//    manager does when another context takes the same lock with "steal". The
+//    call already has its answer, and the late rejection must neither replace
+//    it nor block the bridge for the call after it.
+installLocks({
+  request: async (name, holder) => {
+    await holder({name, mode: 'exclusive'})
+    throw new DOMException('lock broken by another request with the "steal" option', 'AbortError')
+  },
+})
+const stolenAfter = await settles(call('get', {id}))
+ok('a lock stolen after the call ran does not change its answer', stolenAfter.id === id, JSON.stringify(stolenAfter))
+const afterStolen = await settles(call('get', {id}))
+ok('and the call after it still answers', afterStolen.id === id, JSON.stringify(afterStolen))
+
+// 3b. The lock is stolen while the holder is still running: the request
+//     rejects at once, and the work answers later. The work's answer is the
+//     one the page gets, because the work is what happened; reporting a
+//     refusal over a save that landed would be the lie. The call is one that
+//     reaches for a node, so the work yields to the event loop and the
+//     rejection actually arrives first.
+installLocks({
+  request: (name, holder) => {
+    void holder({name, mode: 'exclusive'})
+    return Promise.reject(new DOMException('lock broken by another request with the "steal" option', 'AbortError'))
+  },
+})
+const stolenDuring = await settles(
+  call('estimate', {id, settings: {...SETTINGS, btcEsplora: 'http://127.0.0.1:1'}}),
+)
+ok(
+  'a lock stolen while the call runs still answers with the work',
+  stolenDuring.feeRateFrom === 'fallback' && !stolenDuring.error,
+  JSON.stringify(stolenDuring),
+)
+
+// 4. The request throws synchronously instead of returning a promise.
+installLocks({
+  request: () => {
+    throw new TypeError('request is not a function today')
+  },
+})
+const threwSync = await settles(call('get', {id}))
+ok('a manager that throws answers the call with the error', /request is not a function today/.test(threwSync.error ?? ''), JSON.stringify(threwSync))
+
+restoreNavigator()
+// Let any rejection the scenarios left behind surface before it is counted.
+await new Promise((r) => setTimeout(r, 20))
+process.off('unhandledRejection', noteUnhandled)
+ok('no scenario left a rejection unhandled', unhandled.length === 0, unhandled.join(' | '))
+
 // ---------- result ----------
 
 console.log(`\n${checks - failures}/${checks} checks passed`)

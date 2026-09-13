@@ -258,12 +258,15 @@ export async function wasmCall<T>(method: string, body?: unknown): Promise<T> {
  * record as it now is.
  */
 export class EngineError extends Error {
-  constructor(
-    message: string,
-    public readonly code?: string,
-  ) {
+  // Declared and assigned rather than a constructor parameter property: the
+  // Node test runners load this file with type stripping, which removes type
+  // syntax but does not rewrite it, and a parameter property is a rewrite.
+  readonly code?: string
+
+  constructor(message: string, code?: string) {
     super(message)
     this.name = 'EngineError'
+    this.code = code
   }
 }
 
